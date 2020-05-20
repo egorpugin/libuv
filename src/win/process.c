@@ -942,7 +942,7 @@ int uv_spawn(uv_loop_t* loop,
   BOOL result;
   WCHAR* application_path = NULL, *application = NULL, *arguments = NULL,
          *env = NULL, *cwd = NULL;
-  STARTUPINFOW startup;
+  STARTUPINFOEXW startup;
   PROCESS_INFORMATION info;
   DWORD process_flags;
 
@@ -964,6 +964,7 @@ int uv_spawn(uv_loop_t* loop,
                               UV_PROCESS_SETUID |
                               UV_PROCESS_WINDOWS_HIDE |
                               UV_PROCESS_WINDOWS_HIDE_CONSOLE |
+                              UV_PROCESS_WINDOWS_ALLOC_CONSOLE |
                               UV_PROCESS_WINDOWS_HIDE_GUI |
                               UV_PROCESS_WINDOWS_VERBATIM_ARGUMENTS)));
 
@@ -1051,20 +1052,56 @@ int uv_spawn(uv_loop_t* loop,
     goto done;
   }
 
-  startup.cb = sizeof(startup);
-  startup.lpReserved = NULL;
-  startup.lpDesktop = NULL;
-  startup.lpTitle = NULL;
-  startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+  startup.StartupInfo.cb = sizeof(startup);
+  startup.StartupInfo.lpReserved = NULL;
+  startup.StartupInfo.lpDesktop = NULL;
+  startup.StartupInfo.lpTitle = NULL;
+  startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
 
-  startup.cbReserved2 = uv__stdio_size(process->child_stdio_buffer);
-  startup.lpReserved2 = (BYTE*) process->child_stdio_buffer;
+  startup.StartupInfo.cbReserved2 = uv__stdio_size(process->child_stdio_buffer);
+  startup.StartupInfo.lpReserved2 = (BYTE*) process->child_stdio_buffer;
 
-  startup.hStdInput = uv__stdio_handle(process->child_stdio_buffer, 0);
-  startup.hStdOutput = uv__stdio_handle(process->child_stdio_buffer, 1);
-  startup.hStdError = uv__stdio_handle(process->child_stdio_buffer, 2);
+  startup.StartupInfo.hStdInput = uv__stdio_handle(process->child_stdio_buffer, 0);
+  startup.StartupInfo.hStdOutput = uv__stdio_handle(process->child_stdio_buffer, 1);
+  startup.StartupInfo.hStdError = uv__stdio_handle(process->child_stdio_buffer, 2);
 
-  process_flags = CREATE_UNICODE_ENVIRONMENT;
+  HANDLE *rgHandlesToInherit = (HANDLE*) uv__malloc(options->stdio_count * sizeof(HANDLE));
+  for (int i = 0; i < options->stdio_count; i++)
+      rgHandlesToInherit[i] = uv__stdio_handle(process->child_stdio_buffer, i);
+
+  SIZE_T size = 0;
+  LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)options->attribute_list;
+  BOOL fSuccess = TRUE;
+  BOOL fInitialized = FALSE;
+  if (!(options->flags & UV_PROCESS_WINDOWS_ALLOC_CONSOLE)) {
+    if (!lpAttributeList) {
+        fSuccess = InitializeProcThreadAttributeList(NULL, 1, 0, &size) ||
+        GetLastError() == ERROR_INSUFFICIENT_BUFFER;
+        if (fSuccess) {
+            lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)
+                (HeapAlloc(GetProcessHeap(), 0, size));
+            fSuccess = lpAttributeList != NULL;
+        }
+        if (fSuccess) {
+            fSuccess = InitializeProcThreadAttributeList(lpAttributeList,
+                1, 0, &size);
+        }
+    }
+    if (fSuccess) {
+        fInitialized = TRUE;
+        fSuccess = UpdateProcThreadAttribute(lpAttributeList,
+            0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            rgHandlesToInherit,
+            options->stdio_count * sizeof(HANDLE), NULL, NULL);
+        if (!fSuccess) {
+            err = GetLastError();
+            goto done;
+        }
+    }
+  }
+  startup.lpAttributeList = lpAttributeList;
+
+  process_flags = CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
 
   if ((options->flags & UV_PROCESS_WINDOWS_HIDE_CONSOLE) ||
       (options->flags & UV_PROCESS_WINDOWS_HIDE)) {
@@ -1079,12 +1116,17 @@ int uv_spawn(uv_loop_t* loop,
   if ((options->flags & UV_PROCESS_WINDOWS_HIDE_GUI) ||
       (options->flags & UV_PROCESS_WINDOWS_HIDE)) {
     /* Use SW_HIDE to avoid any potential process window. */
-    startup.wShowWindow = SW_HIDE;
+    startup.StartupInfo.wShowWindow = SW_HIDE;
   } else {
-    startup.wShowWindow = SW_SHOWDEFAULT;
+    startup.StartupInfo.wShowWindow = SW_SHOWDEFAULT;
   }
 
-  if (options->flags & UV_PROCESS_DETACHED) {
+  BOOL inheritHandles = TRUE;
+  if (options->flags & UV_PROCESS_WINDOWS_ALLOC_CONSOLE) {
+    process_flags |= CREATE_NEW_CONSOLE;
+    inheritHandles = FALSE;
+  }
+  else if (options->flags & UV_PROCESS_DETACHED) {
     /* Note that we're not setting the CREATE_BREAKAWAY_FROM_JOB flag. That
      * means that libuv might not let you create a fully daemonized process
      * when run under job control. However the type of job control that libuv
@@ -1102,11 +1144,11 @@ int uv_spawn(uv_loop_t* loop,
                      arguments,
                      NULL,
                      NULL,
-                     1,
+                     inheritHandles,
                      process_flags,
                      env,
                      cwd,
-                     &startup,
+                     (STARTUPINFOW*)&startup,
                      &info)) {
     /* CreateProcessW failed. */
     err = GetLastError();
@@ -1168,7 +1210,13 @@ int uv_spawn(uv_loop_t* loop,
   uv__handle_start(process);
 
   /* Cleanup, whether we succeeded or failed. */
- done:
+done:
+  if (!options->attribute_list) {
+      if (fInitialized) DeleteProcThreadAttributeList(lpAttributeList);
+      if (lpAttributeList) HeapFree(GetProcessHeap(), 0, lpAttributeList);
+  }
+  uv__free(rgHandlesToInherit);
+
   uv__free(application);
   uv__free(application_path);
   uv__free(arguments);
