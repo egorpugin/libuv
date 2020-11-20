@@ -991,6 +991,12 @@ typedef struct uv_process_options_s {
    */
   uv_uid_t uid;
   uv_gid_t gid;
+  /*
+   * Represents a set of attributes that passed with STARTUPINFOEXW
+   * on Windows. This is not supported on unix; uv_spawn() will fail
+   * and set the error to UV_ENOTSUP.
+   */
+  void *attribute_list;
 } uv_process_options_t;
 
 /*
@@ -1039,7 +1045,11 @@ enum uv_process_flags {
    * option is only meaningful on Windows systems. On Unix it is silently
    * ignored.
    */
-  UV_PROCESS_WINDOWS_HIDE_GUI = (1 << 6)
+  UV_PROCESS_WINDOWS_HIDE_GUI = (1 << 6),
+  /*
+   * Create new console.
+   */
+  UV_PROCESS_WINDOWS_ALLOC_CONSOLE = (1 << 7),
 };
 
 /*
